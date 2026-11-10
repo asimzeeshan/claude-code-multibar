@@ -129,22 +129,87 @@ run_with_timeout() {
     fi
 }
 
-# Claude Code relocates its config dir via these env vars; the statusline inherits its env
-readonly CLAUDE_CFG_DIR="${CLAUDE_SECURESTORAGE_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-${HOME}/.claude}}"
+# ---- Claude Code account resolution ----
+# Claude Code relocates its config dir via these env vars (the statusline
+# inherits its env), and each config dir is a separate account: its own state
+# and, on macOS, its own Keychain item. Everything account-specific below
+# (credentials, Keychain item, usage caches) is derived from this one value, so
+# a second account never renders the default account's usage numbers.
+# CLAUDE_SECURESTORAGE_CONFIG_DIR wins whenever it is set, even to an empty
+# string (which means the default dir), mirroring Claude Code's own lookup.
+if [[ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR+set}" ]]; then
+    CLAUDE_CFG_RAW="$CLAUDE_SECURESTORAGE_CONFIG_DIR"
+else
+    CLAUDE_CFG_RAW="${CLAUDE_CONFIG_DIR:-}"
+fi
+
+CLAUDE_HOME="${HOME:-}"
+while [[ "$CLAUDE_HOME" == */ && "$CLAUDE_HOME" != "/" ]]; do CLAUDE_HOME="${CLAUDE_HOME%/}"; done
+
+# File-system form of the dir: a literal ~ the shell did not expand is expanded
+# (only alone or before "/": "~otheruser/x" is another user's home), trailing
+# slashes are dropped, and a relative path is anchored to the working directory.
+CLAUDE_CFG_DIR="${CLAUDE_CFG_RAW:-$CLAUDE_HOME/.claude}"
+if [[ -n "$CLAUDE_HOME" && ( "$CLAUDE_CFG_DIR" == "~" || "$CLAUDE_CFG_DIR" == "~/"* ) ]]; then
+    CLAUDE_CFG_DIR="${CLAUDE_HOME}${CLAUDE_CFG_DIR#\~}"
+fi
+while [[ "$CLAUDE_CFG_DIR" == */ && "$CLAUDE_CFG_DIR" != "/" ]]; do
+    CLAUDE_CFG_DIR="${CLAUDE_CFG_DIR%/}"
+done
+[[ "$CLAUDE_CFG_DIR" != /* ]] && CLAUDE_CFG_DIR="${PWD:-.}/$CLAUDE_CFG_DIR"
+readonly CLAUDE_CFG_RAW CLAUDE_HOME CLAUDE_CFG_DIR
 readonly CREDENTIALS_FILE="$CLAUDE_CFG_DIR/.credentials.json"
 
-# Keychain item holding the OAuth blob on a default-config macOS install
-readonly KEYCHAIN_SERVICE="Claude Code-credentials"
+# First 8 hex chars of sha256(string). Each candidate tool is tried in turn and
+# its output validated, so a present-but-broken tool falls through to the next.
+sha256_head8() {
+    local input="${1:-}" out=""
+    if command_exists shasum; then
+        out=$(printf '%s' "$input" | shasum -a 256 2>/dev/null | cut -c1-8)
+        [[ "$out" =~ ^[0-9a-f]{8}$ ]] && { printf '%s' "$out"; return 0; }
+    fi
+    if command_exists sha256sum; then
+        out=$(printf '%s' "$input" | sha256sum 2>/dev/null | cut -c1-8)
+        [[ "$out" =~ ^[0-9a-f]{8}$ ]] && { printf '%s' "$out"; return 0; }
+    fi
+    if command_exists openssl; then
+        # OpenSSL 3.x prints "SHA2-256(stdin)= <hash>", 1.x prints "(stdin)= <hash>"
+        out=$(printf '%s' "$input" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}' | cut -c1-8)
+        [[ "$out" =~ ^[0-9a-f]{8}$ ]] && { printf '%s' "$out"; return 0; }
+    fi
+    return 1
+}
+
+# Keychain item holding the OAuth blob on macOS. With no config-dir variable
+# set, Claude Code uses the bare name; with one set it appends "-<first 8 hex
+# of sha256(the variable's value)>", hashing the value exactly as given (so it
+# is not normalized here either). ACCOUNT_TAG is that same suffix, reused to
+# keep each account's usage cache, lock and fail marker apart; it is empty in
+# the default case, so a single-account install keeps its existing file names.
+if [[ -z "$CLAUDE_CFG_RAW" ]]; then
+    ACCOUNT_TAG=""
+    KEYCHAIN_SERVICE="Claude Code-credentials"
+elif ACCOUNT_HASH="$(sha256_head8 "$CLAUDE_CFG_RAW")"; then
+    ACCOUNT_TAG="-$ACCOUNT_HASH"
+    KEYCHAIN_SERVICE="Claude Code-credentials${ACCOUNT_TAG}"
+else
+    # No usable hash tool. The tag stays unique per config dir so two relocated
+    # accounts still cannot share a cache, and the service is left empty so the
+    # default account's credentials are never read and reported as this one's.
+    ACCOUNT_TAG="-$(printf '%s' "$CLAUDE_CFG_DIR" | tr -c '[:alnum:]' '_')"
+    KEYCHAIN_SERVICE=""
+fi
+readonly ACCOUNT_TAG KEYCHAIN_SERVICE
 
 # Presence check only: no -w, so the secret is never read here
 credentials_present() {
     [[ -f "$CREDENTIALS_FILE" ]] && return 0
     command_exists security || return 1
-    # Relocated config dir salts the keychain item name with a path hash; it cannot
-    # be probed by name, so abstain (treat as logged in) rather than nag falsely
-    [[ -n "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-}}" ]] && return 0
+    # Item name unknown (no hash tool for a relocated config dir): abstain
+    # (treat as logged in) rather than nag falsely
+    [[ -z "$KEYCHAIN_SERVICE" ]] && return 0
     # Cache the probe: security can stall on a locked keychain, and this path runs every render that has no usage data
-    local probe_cache="$BASE_CACHE_DIR/keychain_present"
+    local probe_cache="$BASE_CACHE_DIR/keychain_present${ACCOUNT_TAG}"
     if ! is_cache_valid "$probe_cache" 60; then
         local found=0
         security find-generic-password -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 && found=1
@@ -175,8 +240,9 @@ maybe_cleanup_sessions() {
     [[ -z "${BASE_CACHE_DIR:-}" ]] && return 0
     find "$BASE_CACHE_DIR" -maxdepth 1 -name 'session_*' -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null
     find "$BASE_CACHE_DIR" -maxdepth 2 -type f -mmin +60 \
-        \( -name 'usage_api_shared.??????' \
-        -o -name 'usage_api.fail.??????' \
+        \( -name 'usage_api_shared*.??????' \
+        -o -name 'usage_api*.fail.??????' \
+        -o -name 'keychain_present*.??????' \
         -o -name 'codex_rate_limits_shared.??????' \
         -o -name 'codex_rate_limits.fail.??????' \
         -o -name 'kimi_balance.??????' \
@@ -187,8 +253,8 @@ maybe_cleanup_sessions() {
         -o -name 'previous_tokens.??????' \) \
         -delete 2>/dev/null
     # write_cache_atomic leaves its mktemp file behind when the script is
-    # killed between mktemp and mv; the persistent cache lives in ~/.claude.
-    find "${HOME}/.claude" -maxdepth 1 -type f -mmin +60 \
+    # killed between mktemp and mv; the persistent cache lives in the config dir.
+    find "$CLAUDE_CFG_DIR" -maxdepth 1 -type f -mmin +60 \
         -name 'usage_api_last_good.json.??????' -delete 2>/dev/null
     # Lock files are deliberately not swept: unlinking a held lock makes the
     # next opener lock a different inode, breaking mutual exclusion.
@@ -430,14 +496,14 @@ print(int(datetime.datetime.fromisoformat(s).timestamp()))
 #      On success: write api_cache + persistent_cache, clear fail marker.
 #      On failure: write fail_marker so step 2 short-circuits next run.
 #   4) Stale shared cache (expired TTL but file exists).
-#   5) Persistent last-good cache at ~/.claude/usage_api_last_good.json.
-#   6) Manual cache at ~/.claude/usage_cache.json (read-only; never
+#   5) Persistent last-good cache at <config dir>/usage_api_last_good.json.
+#   6) Manual cache at <config dir>/usage_cache.json (read-only; never
 #      propagated to api_cache to prevent poisoning).
 #
 # Response fields consumed: five_hour / seven_day (+ legacy seven_day_sonnet /
 # seven_day_opus, which the API now sends as null), extra_usage
 # {is_enabled, utilization}, and limits[] entries with kind "weekly_scoped"
-# (model promos like Fable). ~/.claude/usage_cache.json remains a manual
+# (model promos like Fable). <config dir>/usage_cache.json remains a manual
 # fallback and may use the same shape.
 #
 # Why not Claude Code's native stdin rate_limits fields? They only carry the
@@ -453,11 +519,11 @@ is_usage_response() {
 }
 
 fetch_usage_data() {
-    local api_cache="$BASE_CACHE_DIR/usage_api_shared"
-    local persistent_cache="${HOME}/.claude/usage_api_last_good.json"
-    local manual_cache="${HOME}/.claude/usage_cache.json"
-    local lock_file="$BASE_CACHE_DIR/usage_api.lock"
-    local fail_marker="$BASE_CACHE_DIR/usage_api.fail"
+    local api_cache="$BASE_CACHE_DIR/usage_api_shared${ACCOUNT_TAG}"
+    local persistent_cache="$CLAUDE_CFG_DIR/usage_api_last_good.json"
+    local manual_cache="$CLAUDE_CFG_DIR/usage_cache.json"
+    local lock_file="$BASE_CACHE_DIR/usage_api${ACCOUNT_TAG}.lock"
+    local fail_marker="$BASE_CACHE_DIR/usage_api${ACCOUNT_TAG}.fail"
 
     # 1) Shared cache still valid? Return immediately.
     if is_cache_valid "$api_cache" "$STATUSLINE_USAGE_TTL"; then
@@ -495,7 +561,7 @@ fetch_usage_data() {
                     token=$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDENTIALS_FILE" 2>/dev/null)
                 fi
                 # macOS: Claude Code stores OAuth creds in the Keychain, not .credentials.json
-                if [[ -z "$token" ]] && command_exists security; then
+                if [[ -z "$token" && -n "$KEYCHAIN_SERVICE" ]] && command_exists security; then
                     token=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null | \
                         jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
                     [[ -z "$token" ]] && debug_log "Keychain lookup returned no token"
@@ -1350,9 +1416,9 @@ if [[ "$is_anthropic_model" == true ]] && usage_data=$(fetch_usage_data) && [[ -
     # healthy run serves a cache younger than the TTL; anything much older
     # means the API fetch keeps failing and these numbers are a snapshot.
     usage_src=""
-    for f in "$BASE_CACHE_DIR/usage_api_shared" \
-             "${HOME}/.claude/usage_api_last_good.json" \
-             "${HOME}/.claude/usage_cache.json"; do
+    for f in "$BASE_CACHE_DIR/usage_api_shared${ACCOUNT_TAG}" \
+             "$CLAUDE_CFG_DIR/usage_api_last_good.json" \
+             "$CLAUDE_CFG_DIR/usage_cache.json"; do
         [[ -f "$f" ]] && { usage_src="$f"; break; }
     done
     if [[ -n "$usage_src" ]]; then
